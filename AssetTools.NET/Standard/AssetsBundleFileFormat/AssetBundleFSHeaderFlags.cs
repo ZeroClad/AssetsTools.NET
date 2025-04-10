@@ -6,6 +6,8 @@
         LZMACompressed = 0x01,
         LZ4Compressed = 0x02,
         LZ4HCCompressed = 0x03,
+        COMPRESSION_4 = 0x04,
+        COMPRESSION_5 = 0x05,
         CompressionMask = 0x3f,
         HasDirectoryInfo = 0x40,
         BlockAndDirAtEnd = 0x80,

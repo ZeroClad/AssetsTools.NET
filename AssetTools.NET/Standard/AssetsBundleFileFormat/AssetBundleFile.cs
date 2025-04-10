@@ -5,6 +5,7 @@ using SevenZip.Compression.LZMA;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 namespace AssetsTools.NET
 {
@@ -613,6 +614,20 @@ namespace AssetsTools.NET
                 writer.Align16();
         }
 
+        private int ReadLongLengthNoCheck(byte[] ip, int pos, out int l)
+        {
+            int b = 0;
+            l = 0;
+            while (true)
+            {
+                b = ip[pos++];
+                l += b;
+                if (b != 255)
+                    break;
+            }
+            return pos;
+        }
+
         private void UnpackInfoOnly()
         {
             if (Header == null)
@@ -635,32 +650,32 @@ namespace AssetsTools.NET
                 switch (Header.GetCompressionType())
                 {
                     case 1:
-                    {
-                        using (MemoryStream mstream = new MemoryStream(Reader.ReadBytes(compressedSize)))
                         {
-                            blocksInfoStream = new MemoryStream();
-                            SevenZipHelper.StreamDecompress(mstream, blocksInfoStream, compressedSize, decompressedSize);
+                            using (MemoryStream mstream = new MemoryStream(Reader.ReadBytes(compressedSize)))
+                            {
+                                blocksInfoStream = new MemoryStream();
+                                SevenZipHelper.StreamDecompress(mstream, blocksInfoStream, compressedSize, decompressedSize);
+                            }
+                            break;
                         }
-                        break;
-                    }
                     case 2:
                     case 3:
-                    {
-                        byte[] uncompressedBytes = new byte[Header.FileStreamHeader.DecompressedSize];
-                        using (MemoryStream mstream = new MemoryStream(Reader.ReadBytes(compressedSize)))
                         {
-                            var decoder = new Lz4DecoderStream(mstream);
-                            decoder.Read(uncompressedBytes, 0, (int)Header.FileStreamHeader.DecompressedSize);
-                            decoder.Dispose();
+                            byte[] uncompressedBytes = new byte[Header.FileStreamHeader.DecompressedSize];
+                            using (MemoryStream mstream = new MemoryStream(Reader.ReadBytes(compressedSize)))
+                            {
+                                var decoder = new Lz4DecoderStream(mstream);
+                                decoder.Read(uncompressedBytes, 0, (int)Header.FileStreamHeader.DecompressedSize);
+                                decoder.Dispose();
+                            }
+                            blocksInfoStream = new MemoryStream(uncompressedBytes);
+                            break;
                         }
-                        blocksInfoStream = new MemoryStream(uncompressedBytes);
-                        break;
-                    }
                     default:
-                    {
-                        blocksInfoStream = null;
-                        break;
-                    }
+                        {
+                            blocksInfoStream = null;
+                            break;
+                        }
                 }
 
                 using (memReader = new AssetsFileReader(blocksInfoStream))
@@ -674,31 +689,96 @@ namespace AssetsTools.NET
 
             // it hasn't been seen but it's possible we
             // find mixed lz4 and lzma. if so, that's bad news.
-            switch (GetCompressionType())
+
+            // align stream to 16
+            if (Reader.Position % 16 != 0)
+                Reader.Position = Reader.Position + 16 - Reader.Position % 16;
+
+            IEnumerable<byte> fixedData = new List<byte>();
+            foreach (var info in BlockAndDirInfo.BlockInfos)
             {
-                case AssetBundleCompressionType.None:
+                if (info.GetCompressionType() == 4 || info.GetCompressionType() == 5)
                 {
-                    SegmentStream dataStream = new SegmentStream(Reader.BaseStream, Header.GetFileDataOffset());
-                    DataReader = new AssetsFileReader(dataStream);
-                    DataIsCompressed = false;
-                    break;
+                    var decompressedSize = info.DecompressedSize;
+
+                    int ip = 0;
+                    int op = 0;
+                    const byte AK_LITERAL_LENGTH_MASK = 0x0F;
+                    const byte AK_MATCH_LENGTH_MASK = 0xF0;
+                    byte[] fixedCompressedData = Reader.ReadBytes((int)info.CompressedSize);
+                    while (true)
+                    {
+                        byte currentByte = fixedCompressedData[ip];
+                        int literalLength = currentByte & AK_LITERAL_LENGTH_MASK;
+                        int matchLength = (currentByte & AK_MATCH_LENGTH_MASK) >> 4 & 0xff;
+                        fixedCompressedData[ip] = (byte)(((literalLength << 4) | matchLength) & 0xff);
+                        ip++;
+                        if (literalLength == 15)
+                        {
+                            ip = ReadLongLengthNoCheck(fixedCompressedData, ip, out int l);
+                            literalLength += l;
+                        }
+                        op += literalLength;
+                        ip += literalLength;
+                        if (ip > 10000)
+                            op = op;
+                        if (decompressedSize == op)
+                            break;
+                        int offset = 0;
+                        try
+                        {
+                            offset = fixedCompressedData[ip] << 8 | fixedCompressedData[ip + 1];
+                        }
+                        catch
+                        {
+                        }
+                        fixedCompressedData[ip] = (byte)(offset & 0xFF);
+                        fixedCompressedData[ip + 1] = (byte)((offset >> 8) & 0xFF);
+                        ip += 2;
+                        if (matchLength == 15)
+                        {
+                            ip = ReadLongLengthNoCheck(fixedCompressedData, ip, out int m);
+                            matchLength += m;
+                        }
+                        matchLength += 4;
+                        op += matchLength;
+                    }
+                    fixedData = fixedData.Concat(fixedCompressedData);
+                    info.Flags = 3;
                 }
-                case AssetBundleCompressionType.LZMA:
+                else
                 {
-                    SegmentStream dataStream = new SegmentStream(Reader.BaseStream, Header.GetFileDataOffset());
-                    DataReader = new AssetsFileReader(dataStream);
-                    DataIsCompressed = true;
-                    break;
-                }
-                case AssetBundleCompressionType.LZ4:
-                {
-                    LZ4BlockStream dataStream = new LZ4BlockStream(Reader.BaseStream, Header.GetFileDataOffset(), BlockAndDirInfo.BlockInfos);
-                    DataReader = new AssetsFileReader(dataStream);
-                    DataIsCompressed = false;
-                    break;
+                    byte[] fixedCompressedData = Reader.ReadBytes((int)info.CompressedSize);
+                    fixedData = fixedData.Concat(fixedCompressedData);
                 }
             }
 
+            switch (GetCompressionType())
+            {
+                case AssetBundleCompressionType.None:
+                    {
+                        SegmentStream dataStream = new SegmentStream(new MemoryStream(fixedData.ToArray()), 0);
+                        DataReader = new AssetsFileReader(dataStream);
+                        DataIsCompressed = false;
+                        break;
+                    }
+                case AssetBundleCompressionType.LZMA:
+                    {
+                        SegmentStream dataStream = new SegmentStream(new MemoryStream(fixedData.ToArray()), 0);
+                        DataReader = new AssetsFileReader(dataStream);
+                        DataIsCompressed = true;
+                        break;
+                    }
+                case AssetBundleCompressionType.LZ4:
+                    {
+                        LZ4BlockStream dataStream = new LZ4BlockStream(new MemoryStream(fixedData.ToArray()), 0, BlockAndDirInfo.BlockInfos);
+                        DataReader = new AssetsFileReader(dataStream);
+                        DataIsCompressed = false;
+                        break;
+                    }
+                default:
+                    throw new NotSupportedException();
+            }
         }
 
         /// <summary>
@@ -719,6 +799,8 @@ namespace AssetsTools.NET
                 {
                     return AssetBundleCompressionType.LZMA;
                 }
+                else if (compType == 4 || compType == 5)
+                    return AssetBundleCompressionType.COMPRESSION_4;
             }
 
             return AssetBundleCompressionType.None;
@@ -827,6 +909,8 @@ namespace AssetsTools.NET
         None,
         LZMA,
         LZ4,
-        LZ4Fast
+        LZ4Fast,
+        COMPRESSION_4,
+        COMPRESSION_5
     }
 }
